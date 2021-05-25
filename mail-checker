@@ -1,0 +1,743 @@
+#!/bin/sh
+#
+# validate your email servers
+# 2021 <nick@kousu.ca> MIT
+#
+
+
+cat >/dev/null <<NOTES
+
+What do I need to make email work?
+
+I need...
+
+a server (so, an IP address)
+a hostname (so, a DNS record)
+an smtp daemon listening on port 25; maybe port 587
+starttls; possibly smtps (what port is smtps)
+
+outgoing:
+- 
+- antispam checks:
+  - not on spam blacklists
+    -> how do I check this??
+  - there should be an A record for example.org
+  - there should be an MX record for example.org (but this MX doesn't /have/ to be the sending server)
+  - SPF should be checked
+  - DKIM (only checkable on an actual sent message)
+  - DMARC (ditto)
+- not an open relay
+- has the right 250- ('HELO') string
+
+# TODO: repeat everything here but for IPv6
+
+
+incoming:
+- to send to example.org I must have:
+  dig MX example.org
+NOTES
+
+
+
+
+strip_comments() {
+  # could probably be better
+  sed 's/#.*$//' | sed '/^[[:space:]]*$/d'
+}
+
+hangiwwewng_indent() {
+  #awk '{print}'
+  indent=$1
+  : ${indent:="    "}
+  awk -v indent="$indent" 'NR==1 { print $0 } NR!=1 { print indent $0; }'
+}
+
+
+indent() {
+  indent="${1:-"    "}" # optional
+  sed 's/^/'"$indent"'/'
+  #awk -v indent="$indent" '{ print indent $0; }'
+}
+
+
+hanging_indent() {
+  #head -n 1
+  read line; echo "$line"
+  indent "$@"
+  
+  # a different implementation:
+  # 
+  indent=$1
+  : ${indent:="    "}
+  awk -v indent="$indent" 'NR==1 { print $0 } NR!=1 { print indent $0; }'
+}
+
+reverse_ip() {
+  echo -n "$1" | sed -r 's/^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})/\4.\3.\2.\1/'
+}
+
+normalize_domain() {
+  echo "$1" | sed 's/\.*$//' | tr '[:upper:]' '[:lower:]'
+}
+
+port_open() {
+  # usage: port_open host port
+  # detect if a port is open, closed, or firewalled
+  # if open: returns 0
+  # closed: 1
+  # firewalled: 2
+  # 
+  # This test isn't 100% accurate
+  # There are other errors too:
+  # - 255: missing dependency
+  # - 
+  
+  host="$1"; shift
+  port="$1"; shift
+  
+  # weirdly, there's...no good way to distinguish 
+  # https://stackoverflow.com/questions/4922943/test-if-remote-tcp-port-is-open-from-a-shell-script
+  
+  if command -v nmap >/dev/null; then
+    result="$(nmap -Pn -oN - -p "$port" "$host" | grep "$port"'/tcp' | tee /dev/stderr | head -n 1)"
+    if echo "$result" | grep -q open; then
+      return 0;
+    elif echo "$result" | grep -q close; then
+      return 1;
+    elif echo "$result" | grep -q filtered; then
+      return 2;
+    else
+      echo "error: unknown result from nmap: "$result"" >&2
+      return 200
+    fi
+  elif command -v nc >/dev/null; then
+    if result="$(nc -w 5 -z -v "$host" "$port" 2>&1)"; then
+      return 0
+    else
+      if echo "$result" | grep -q "timed out"; then
+        return 2
+      else
+        return 1
+      fi
+    fi
+  #elif command -v bash && command -v timeout? # bash has magic virtual devices /dev/tcp/$host/$port; you can combine them with linux's timeout(1) command to do the test
+  else
+    echo "error: nmap or nc are required for port scanning" >&2
+    return 255
+  fi
+
+}
+
+query_dnsbl() {
+  # usage: query_dnsbl server ip
+  # look up an IP address in a DNS blacklist server.
+  # true: address is clean
+  # false: address is blacklisted
+  # algorithm: https://en.wikipedia.org/wiki/Domain_Name_System-based_blackhole_list#DNSBL_queries
+  dnsbl="$1"; shift
+  ip="$1"; shift
+  
+  # XXX this doesn't account for other kinds of errors:
+  # - network errors
+  # - typos in the server
+  # - the server not being a DNSBL server
+  # - getting rate limited
+  # All of these will appear to be *not* blacklisted
+  #
+  # but a semi-standard is that querying 127.0.0.2 should give back 127.0.0.2, so you can test if the list is up by doing that
+  
+  query="$(reverse_ip "$ip")"."$dnsbl"
+  result="$(dig +short A "$query")"
+  if [ -z "$result" ]; then
+    # not blacklisted
+    return 0;
+  else
+    # optional
+    #echo "$result" >&2 # DEBUG
+    reason="$(dig +short TXT "$query")"
+    echo "$reason" >&2
+    return 1
+  fi
+}
+
+
+
+
+
+query_dnsbls() {
+  ip="$1"; shift
+  
+  # from https://en.wikipedia.org/wiki/Comparison_of_DNS_blacklists and
+  # https://www.mail-tester.com/
+  BLACKLISTS=$(cat <<EOF
+# https://www.rackaid.com/blog/email-blacklists/:
+# > Based on research by Return Path, Sendgrid, Proofpoint and other major
+# > email service providers,  these email blacklists have been shown to
+# > influence email delivery to Yahoo!, Gmail, Microsoft and other major
+# > providers.   If your IP lands on of of the lists, especially Spamhaus’
+# > lists, you will have wide spread delivery issues.
+
+#Spamhaus ZEN,https://www.spamhaus.org/zen/,zen.spamhaus.org # union of all the spamhaus lists
+
+Spamhaus SBL Advisory,https://www.spamhaus.org/sbl/,sbl.spamhaus.org
+#Spamhaus CSS Advisory,https://www.spamhaus.org/css/,sbl.spamhaus.org # merged into SBL?
+Spamhaus XBL Advisory,https://www.spamhaus.org/xbl/,xbl.spamhaus.org
+
+Spamhaus PBL Advisory,https://www.spamhaus.org/pbl/,pbl.spamhaus.org
+Barracuda,https://barracudacentral.org/rbl,b.barracudacentral.org
+Hostkarma,https://ipadmin.junkemailfilter.com/remove.php,hostkarma.junkemailfilter.com
+
+IMP-SPAM,http://antispam.imp.ch/,dnsrbl.imp.ch
+BACKSCATTERER,http://www.backscatterer.org/index.php,ips.backscatterer.org
+#China Anti-Spam Alliance,http://www.anti-spam.org.cn/,?????
+
+LashBack,http://blacklist.lashback.com/,ubl.unsubscore.com
+#Mailskipe,http://mailskipe.net/,<dead?>
+NiX Spam,http://www.dnsbl.manitu.net/,ix.dnsbl.manitu.net
+
+REDHAWK,https://www.redhawk.org/SpamHawk/,access.redhawk.org
+
+SORBS,http://www.sorbs.net/lookup.shtml,dnsbl.sorbs.net
+SORBS (open relay),http://www.sorbs.net/lookup.shtml,smtp.dnsbl.sorbs.net
+SORBS (48 hours),http://www.sorbs.net/lookup.shtml,new.spam.dnsbl.sorbs.net
+SORBS (28 days),http://www.sorbs.net/lookup.shtml,recent.spam.dnsbl.sorbs.net 
+
+SPAMCOP,https://www.spamcop.net/bl.shtml,bl.spamcop.net
+
+SEM-BACKSCATTER,https://spameatingmonkey.com/services/SEM-BACKSCATTER,backscatter.spameatingmonkey.net
+SEM-BLACK,https://spameatingmonkey.com/services/SEM-BLACK,https://spameatingmonkey.com/,bl.spameatingmonkey.net
+
+RATS-ALL,https://www.spamrats.com/,all.spamrats.com
+PSBL,https://psbl.org/,psbl.surriel.com
+
+#SWINOG??
+
+GBUdb Truncate,http://www.gbudb.com/truncate/index.jsp,truncate.gbudb.net
+WPBL,http://wpbl.pc9.org/,db.wpbl.info
+
+#InvaluementSIP,https://www.invaluement.com/#sip,<paid access via rsync, not via dns>
+#InvaluementSIP/24,https://www.invaluement.com/#sip24,<paid access via rsync, not via dns>
+
+#SenderScore,https://www.senderscore.org/,<not via DNS>
+EOF
+  )
+  
+  echo "$BLACKLISTS" | strip_comments | (
+    # pipelines implicitly make a subshell
+    # so in order to return $err at the end
+    # we need to make a nested subshell where
+    # we can control the return value
+    err=0
+    
+    IFS=","; # the subshell also limits the scope of this
+    while read name url server; do
+    if reason="$(query_dnsbl "$server" "$ip" 2>&1)"; then
+      echo "🍏 $ip allowed by [$name]($url) (dns://$server)"
+    else
+      echo "🍎 $ip blacklisted by [$name]($url) (dns://$server): $reason"
+      err=1
+    fi
+  done
+  exit $err
+  )
+}
+
+
+incoming() {
+  # usage: outgoing domain mx ip
+  # test that ip, with hostname mx, is a valid incoming mail server for domain
+  
+  domain="$1"; shift
+  mx="$1"; shift
+  ip="$1"; shift
+  
+  mx="$(normalize_domain "$mx")"
+  
+  # to be a valid incoming mail server:
+  # - domain
+  
+  mx_="$(dig +short MX "$domain")"
+  if [ -n "$mx_" ]; then
+    #echo "🍏 $domain has an associated MX record ($mx_)"
+
+    # we should check that..... $ip *is* one of the nominated MXes? maybe?
+    # it's not strictly (or even at all) necessary that the incoming MX and outgoing MX be the same
+    # but it looks less spammy if they are.
+    echo "$mx_" | ( while read priority mx__; do
+      if [ "$mx__" = "$mx" -o "$mx__" = "$mx." ]; then
+        echo "🍏 $mx is one of the incoming MXes for $domain"
+        exit 0
+      fi
+    done
+    exit 1
+    ) || echo "🍎 $mx is not of the incoming MXes for $domain"
+  
+  else
+    echo "🍎 $domain has no associated MX record"
+  fi
+  
+  
+  
+  # check forward and reverse DNS
+  mx_ip="$(dig +short "$mx")"
+  if [ "$mx_ip" = "$ip" ]; then
+    echo "🍏 $mx is $ip (forward DNS)"
+  else
+    echo "🍎 $mx is not $ip (forward DNS)"
+  fi
+  
+  ptr="$(normalize_domain "$(dig +short -x "$ip")")"
+  if [ "$ptr" = "$mx" -o "$ptr" = "$mx." ]; then
+    echo "🍏 $ip is $mx (reverse DNS: $ptr)"
+  else
+    # this is a yellow because it's less important to have working reverse DNS for incoming mail.
+    echo "🍋 $ip is not $mx (reverse DNS: $ptr)"
+  fi
+  
+  # check that it accepts mail
+  if port_open "$ip" 25; then
+  
+    # apps to test smtp:
+    # - openssl s_client -starttls smtp # a terrible choice
+    # - https://github.com/mludvig/smtp-cli
+    # - swaks:
+    #  - possibly swaks -s "$mx" -quit "HELO"
+    #  - possibly swaks -s "$mx" -tls --tls-verify -quit "HELO"
+    #  - possibly swaks -s "$mx" -tlso --tls-verify --to 'postmaster@'"$domain" -quit "TO"
+    # - vrfy (specifically for verifying specific email addresses, but maybe if you just do like postmaster@ in front that's the same?)
+    # - smtpping
+    
+  
+    if command -v swaks >/dev/null; then
+      export LANG=C
+      if transaction="$(swaks -s "$ip" -quit "HELO")"; then
+        echo "🍏 $ip is listening to smtp://"
+        
+        
+        # check hostname
+        echo "$transaction" | egrep "^<-  220" | ( # <-- the subshell is because you can't mix read and pipelines otherwise: the pipeline makes an implicit subshell which immediately forgets the variable's read sets. 
+          read _ code remote_hostname protocol server_software;
+          
+          if [ "$code" -ne 220 ]; then
+            # should be impossible because of the grep above but you never know
+            echo "🍎 smtp://$ip returned malformed SMTP header"
+            exit 1
+          fi
+          
+          if [ "$remote_hostname" = "$mx" ]; then
+            echo "🍏 smtp://$ip knows itself as $mx"
+          else
+            echo "🍋 smtp://$ip does not know itself as $mx (instead: $remote_hostname). [not mandatory]"
+          fi
+        )
+          
+          
+        # test encrypted SMTP
+        # unfortunately, swaks doesn't yet have a way to target
+        # a specific server while also specifying a specific TLS hostname
+        # https://github.com/jetmore/swaks/issues/37
+        # we can either: check that the forward DNS matches, and if so, use
+        # so I think we have to use openssl, which has a terrible API.
+        if echo QUIT | timeout 5 openssl s_client -quiet -no_ign_eof -connect "$ip":25 -starttls smtp -verify_hostname "$mx" -verify_return_error 2>/dev/null; then
+          echo "🍏 $ip smtp+tls://$mx responds"
+        else
+          # yellow because TLS is not, even still, mandatory for mail servers
+          echo "🍋 smtp+tls://$mx does not respond [not mandatory]"
+        fi
+        
+        
+        # TODO: test if TLS is *mandatory*
+        # you should get a 🍏 if you can't do anything before STARTTLS
+        # 
+        
+        # check open relay
+        # XXX maybe this belongs in outgoing()? relaying crosses both parts:
+        #     it receives, then it sends.
+        #     But the concerning thing about an open relay is that it will get you on blocklists,
+        #     so it's the sending part we're more concerned about.
+        if [ "$(get_ip)" = "$ip" ]; then
+            echo "🍋 open relay test must be run from a distinct server than the server under test ($ip)."
+        else
+          # if "$ip" accepts a message for example.org then it is open to the world;
+          # example.org shouldn't be *anyone's* domain, much less $ip's.
+          swaks -s "$ip" -tlso --to 'root@example.org' >/dev/null 2>&1
+          ret=$?
+          if [ "$ret" -eq 24 ]; then
+            # 24 == no recipients accepted, i.e. root@example.org was rejected
+            echo "🍏 $ip is not an open relay."
+          elif [ "$ret" -eq 0 ]; then
+            # 0 == no error, i.e. root@example.org was accepted
+            echo "🍎 $ip is an open relay. This will likely get it quickly banned by blocklists."
+          else
+            echo "🍋 $ip: open relay test inconclusive."
+          fi
+        fi
+      else
+        # at this point, we know *tcp* port 25 is working, but swaks
+        # still failed, which means some *other* protocol is active.
+        echo "🍎 $ip is not speaking smtp://"
+      fi
+      
+      # test actually receiving an email
+      # postmaster@ is supposed to work on all mailservers
+      # XXX bug: because of https://github.com/jetmore/swaks/issues/37,
+      # this is unreliable unless we know that the forward DNS test has also passed
+      # maybe we need two tests? a separate -tls and non-tls test? and maybe we only run the former if the forward DNS test has passed?
+      if swaks -s "$ip" -tlso --to 'postmaster@'"$domain" >/dev/null 2>&1; then
+        echo "🍏 $ip accepts mail for postmaster@${domain}"
+      else
+        echo "🍎 $ip rejects mail for postmaster@${domain}"
+      fi
+    
+    else # result of command -v swaks
+      echo "🍋 swaks must be installed to test incoming mail."
+    fi
+  else # result of port_open
+    ret=$? 
+    if [ "$ret" -eq 1 ]; then
+      echo "🍎 tcp://$ip:25 (smtp) closed"
+    elif [ "$ret" -eq 2 ]; then
+      echo "🍋 tcp://$ip:25 (smtp) timed out; likely firewall (are you testing from a residential connection?)"
+    else
+      # other error: nmap isn't installed or something
+      # maybe this doesn't need an output?
+      echo "🍋 tcp://$ip:25 (smtp) tcp test inconclusive."
+    fi
+  fi
+  
+  if port_open "$ip" 465; then
+    # XXX there's a bug here: because of https://github.com/jetmore/swaks/issues/37
+    # if the forward DNS check failed then this test is incorrect
+    # because we're testing if *$ip* has port 465 open but then that $mx has TLS enabled, and they might not be the same server
+    # or they might be the same server, but might be different IP addresses on it
+    #  -- in fact, particularly, when we're testing from the server itself, usually 127.0.1.1 is returned for "$mx" by /etc/hosts
+    # but usually this is *not* an IP address that the mail server is listening on.
+    #if swaks -s "$mx" -tlsc --tls-verify -quit "HELO"; then
+    # so instead, we have to use s_client again.
+    if echo | openssl s_client -quiet -no_ign_eof -connect "$ip":465 -verify_hostname "$mx" -verify_return_error 2>/dev/null; then
+      echo "🍏 smtps://$mx:465 works"
+      
+      
+      # TODO: repeat all the previous tests for port 25; it's possible to configure the two ports to run separate rulesets
+    else
+      echo "🍋 smtps://$mx:465 doesn't work [not mandatory]"
+    fi
+  else
+    ret=$?
+    if [ "$ret" -eq 1 ]; then
+      # yellow, because it's not mandatory to support smtps://
+      echo "🍋 tcp://$ip:465 (smtps) closed [not mandatory]"
+    elif [ "$ret" -eq 2 ]; then
+      echo "🍋 tcp://$ip:465 (smtps) timed out; likely firewall (are you testing from a residential connection?) [not mandatory]"
+    else
+      # other error: nmap isn't installed or something
+      # maybe this doesn't need an output?
+      echo "🍋 tcp://$ip:465 (smtps) tcp test inconclusive [not mandatory]"
+    fi
+  fi
+}
+
+
+outgoing() {
+  # usage: outgoing domain mx ip
+  # test that ip, with hostname mx, is a valid outgoing mail server for domain
+  
+  domain="$1"; shift
+  mx="$1"; shift
+  ip="$1"; shift
+  
+  mx="$(normalize_domain "$mx")"
+  
+  # maybe it's weird to pass *both* MX and IP?
+  # but I want to be checking that MX == IP as part of the tests
+  # hmm
+  
+  site="$(dig +short A "$domain")"
+  if [ -n "$site" ]; then
+    echo "🍏 $domain has an associated A record ($site)"
+  else
+    echo "🍎 $domain has no associated site"
+  fi
+  
+  
+  # check that $mx is a legitimate MX
+  
+  mx_="$(dig +short MX "$domain")"
+  if [ -n "$mx_" ]; then
+    flat_mx_="$(echo "$mx_" | awk -v ORS=', ' '{print $2}')"
+    echo "🍏 $domain has an associated MX record ($flag_mx_)"
+    # XXX $mx__ is potentially multiple lines; what to do about that?
+
+    # check that the incoming server
+    # we should check that..... $ip *is* one of the nominated MXes? maybe?
+    # it's not strictly (or even at all) necessary that the incoming MX and outgoing MX be the same
+    # but it looks less spammy if they are.
+    # is this test really necessary? MXes are about incoming mail; having one is good because it makes you look more legitimate
+    # but that doesn't mean the sending server needs to *be* the MX; the better parallel is SPF, which is where you declare your sending servers.
+    echo "$mx_" | ( while read priority mx__; do
+      if [ "$mx__" = "$mx" -o "$mx__" = "$mx." ]; then
+        echo "🍏 Outgoing server $mx is one of the inconing MXes for $domain"
+        exit 0
+      fi
+    done
+    exit 1
+    ) || echo "🍋 Outgoing server $mx is not of the incoming MXes for $domain"
+  
+  else
+    echo "🍎 $domain has no associated MX record"
+  fi
+  
+  
+  # check forward and reverse DNS
+  mx_ip="$(dig +short "$mx")"
+  if [ "$mx_ip" = "$ip" ]; then
+    echo "🍏 $mx is $ip (forward DNS)"
+  else
+    echo "🍎 $mx is not $ip (forward DNS)"
+  fi
+  
+  ptr="$(normalize_domain "$(dig +short -x "$ip")")"
+  if [ "$ptr" = "$mx" -o "$ptr" = "$mx." ]; then
+    echo "🍏 $ip is $mx (reverse DNS: $ptr)"
+  else
+    echo "🍎 $ip is not $mx (reverse DNS: $ptr)"
+  fi
+  
+  # test SPF
+  if command -v spfquery >/dev/null; then
+    spf="$(spfquery -sender "$domain" -helo "$mx" -ip "$ip")"
+    if [ "$(echo "$spf" | head -n 1)" = "pass" ]; then
+      echo "🍏 spf: pass"
+      #echo -n "🍏 spf: "; echo "$spf" | hanging_indent #DEBUG
+    else
+      echo -n "🍎 spf: "; echo "$spf" | hanging_indent
+    fi
+  else
+    echo "🍋 spf: spfquery is not installed."
+  fi
+  
+  # test DKIM: no, impossible to do this without putting up a mail server to receive
+  
+  # test DMARC: DMARC is a meta combination of SPF and DKIM; but it's very poorly implemented so who cares
+  
+  # check blacklisting
+  echo "🏴‍☠️  Blocklists:"
+  query_dnsbls "$ip" | indent
+  
+  
+  # TODO: test sending a message
+  # XXX this (should) requires credentials; either:
+  #     - it needs to be run from localhost
+  #     - you need to pass --auth-password and --auth-user
+  #   because if it succeeds otherwise then you're an open relay.
+  # 
+  # Also, to really do this justice you want to see the message accepted somewhere
+  # which is not something we can automate easily; the whole point of this script is that configuring a live mail server
+  # is hard, so having to boot a whole 
+  # maybe the best thing to do is to provide a `--to` option
+  # and give some suggestions in the docs; guerillamail.com, your gmail account, any site running https://github.com/synox/disposable-mailbox, maybe even mail-tester.com
+}
+
+
+
+get_ip() {
+  # get the public IP address of the current system
+
+  # how to do this in different languages:
+  # C: getifaddrs(3)
+  # python: psutil.net_if_addrs or netifaces.interfaces() # https://stackoverflow.com/questions/270745/how-do-i-determine-all-of-my-ip-addresses-when-i-have-multiple-nics
+  # shell: I guess this shady pipeline?
+  #        and this is definitely a linuxism
+  if [ "$(uname)" = "Linux" ]; then
+    list_ips() {
+      ip -4 addr list | grep inet | awk '{print $2}' | cut -f 1 -d '/'
+    }
+  fi
+  #ip -6 addr list | grep inet6 | awk '{print $2}' | cut -f 1 -d '/'
+  
+  # just take..the ..first ..one?
+  # what happens with multiple IPs?
+  # how do you even know what IP you'll be using if you have multiple NICs active?
+  list_ips | grep -v "^127." | head -n 1
+  
+  # curl ifconfig.me # this will also do it
+
+}
+
+
+
+# how do I check that the *current* server has its DNS set up right?
+# I want to 
+
+
+# okay but I *also* want to ask 
+# okay so I have two contradictory desires:
+# - checking for an open relay
+# - checking for the mailserverness of the server the script is run on
+# - checking incoming mail works
+#   - we *can* check that port 25 is open and listening on the right port
+#     but this won't detect firewall problems
+# how do you tell if a
+#  maybeeee I could script putting up a small mail server dynamically
+#  but there's a lot of difficulties there:
+#  - you need to set up an MX record for the temporary server
+#  - you need to set up
+# - sooo actually sending a message is out
+#  - ??
+#  -ff
+
+
+# ./mail-checker - tests that the server you're on is its own working gets hostname and ip address off the live system it's run on and assumes that domain == hostname
+# ./mail-checker mx - tests that ..? mx is a sensible domain name?
+# ./mail-checker
+# ./mail-checker mx 
+
+# three params means 8 combinations:
+# domain,mx,ip
+# 0,0,0 - check the server you're on
+# 0,0,1 - you're only given the IP; how are you supposed to know anything? disallow?
+# 0,1,0 - you're only given the hostname of the MX; assume domain == mx, and get the IP from DNS
+# 0,1,1 - you're given the MX and the IP you expect it to be on; that's fine, assume the domain == mx
+# 1,0,0 - you're given only the domain; you could... get the MX from the DNS, ans assume the same MX should be the outgoing server too?
+# 1,0,1 - you're given the domain and the IP but *not* the hostname; in this case... should this be disallowed? or should you assume the hostname == the IP address? or ???
+# 1,1,0 - you're given the domain and the hostname of the MX; get the IP from DNS
+# 1,1,1 - assume all the given items as given and try to test them as given
+
+# mx is supposed to be *a* hostname of the given ip address
+# - forward DNS should match: $(dig +short A $mx) = $ip
+# - 
+# 
+# ip can be given *either* as a hostname or an IP address?
+# so maybe the arguments should be:
+# domain,hostname,ip
+# if you only give hostname, then try to ip from DNS for it
+# but the hostname can *also* be given *as an IP address*? maybe? does that make sense?
+# so if not explicitly specified
+
+# forms I can do with positional args:
+#  - this is the 0,0,0 case
+# A - this is both the 0,1,0 and 1,0,0 cases
+# A,B
+# domain,mx,ip - this is the 1,1,1 case
+# so I have four options to squeeze 8 cases into
+# two of the cases I dropped: 0,0,1 and 1,0,1. So, it should be impossible to specify *just* the IP; it should always
+# so what do I have left over?
+# 0,0,0 = []
+# 0,0,1 - [disallowed]
+# 0,1,0 - only given the MX => set domain=$mx; ip=$(dig +short $mx)
+# 0,1,1 - given the MX and expected IP => set domain=$mx
+# 1,0,0 - only given the domain => set mx=$domain; ip=$(dig +short $mx)
+# 1,0,1 - [disallowed]
+# 1,1,0 - domain and MX => set ip=$(dig +short $mx) 
+# 1,1,1 - [A,B,C]
+
+# ah here's the trick: 0,1,0 = 1,0,0, because they set mx==domain in both cases
+# so that can be the A case: ./mail-checker [domain|hostname] - assumes domain == hostname (for a simple self-hosted server)
+# and does that mean that 0,1,1 = 1,1,0 too? ... no?
+# sure, in those cases, we give two arguments
+# so it's either
+# ./mail-checker domain mx
+# ./mail-checker mx ip
+#    how can you tell them apart?
+#    you could...check if one of them *looks* like an IP address?
+#    or you could say: why would you *ever* want to use the second form?
+#    in what situation do you want to specify an mx and an ip address without also specifying the domain name like that?
+#    if you're going to go to the trouble to specify the hostname and the ip
+#    the case where you *would* want that is, I think, the 0,0,0 case: because that's when you're running on a local
+
+# okay so here's my cases:
+# ./mail-checker - get hostname and ip address from the local machine, assume domain == hostname; for testing a local server
+# ./mail-checker {domain|hostname} - assume domain == hostname, get ip address from DNS; meant for testing a remote server
+# ./mail-checker {domain} {hostname} - assume ; meant for testing a site with a *separate* MX
+#   - if you are testing your separate MX from itself, use ./mail-checker {domain} $(hostname)
+# ./mail-checker {domain} {hostname} {ip} - full control over what to connect to and test
+#  
+# to squeeze into two cases
+# but it's 
+
+domain=$1
+hostname=$2
+ip=$3
+
+if [ -z "$domain" ]; then
+  domain="$(hostname)"
+fi
+
+if [ -z "$hostname" ]; then
+  hostname="$domain"
+fi
+
+if [ -z "$ip" ]; then
+  if [ $# -eq 0 ]; then
+    # special case:
+    ip="$(get_ip)"
+  else
+    ip="$(dig +short "$hostname")"
+  fi
+fi
+
+echo "$domain:"
+(
+  (echo "incoming:"; incoming "$domain" "$hostname" "$ip" | indent)
+  (echo "outgoing:"; outgoing "$domain" "$hostname" "$ip" | indent)
+) | indent
+echo
+
+
+
+# okay so does this cover the logic above?
+
+# if you give nothing then:
+# - get domain=hostname
+# - set mx=domain
+# - set ip= local ip address
+#
+# if you give 1 argument {domain}:
+# - set mx=domain
+# - set ip=DNS for mx
+# 
+# if you give 2 {domain} {mx}:
+# - set ip=DNS for mx
+#
+# if you give 3:
+# everything is set
+
+#the thing that is different about the logic is:
+# in the 0,0,0 case, ip=$(get_ip)
+
+
+# note: you can test 
+# if you are testing your mailserver frlocalhost
+
+
+# bug: nmap is noisy. why?
+# bug: the MX check compares by domain name; but it should resolve to IP addresses
+# bug: if an MX is given by IP directly:
+#   - tls won't work
+#   - but also the tests will break because they'll try to run dig on an ip address which makes no sense
+
+# options:
+# --[no-]incoming, --[no-]outgoing, --[no-]blocklists, --[no-]send, --[no-]relay: whether to do various parts of the tests
+# --local,--remote - implicit option, determined by the form you're using; or maybe by checking get_ip against the given ip?
+#   when --local:
+#   - tests outgoing mail by connecting to localhost without a password
+#   - disables the open relay test by default
+#   when --remote
+#   - if given --user and --pass, tests outgoing mail by connecting to $mx
+#   - enables the open relay test by default
+# *except*
+#   deciding local based on being in the 0-arg form is dumb; we should do it by the IP address, probably: if the ip address is yourself, assume --local
+
+# maybe the forward/reverse DNS checks don't need to happen in either incoming or outgoing, but can just happen at a top level?
+# but the interpretation of them changes on context...
+
+# huh, I have a config problem; but it hasn't caused me problems:
+# - my reverse DNS *should* probably be 'kousu.ca', *which implies* I should set my mailname to kousu.ca as well
+# and this script exposed that.
+
+# we should: assume that domain == hostname if domain isn't given
+# 
+# I don't *have* to give the arguments as position params
+# i can give them as options
+
+# mx is: the hostname of the server
